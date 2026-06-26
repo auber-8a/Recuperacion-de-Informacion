@@ -1,0 +1,5 @@
+.env
+# Ignorar cualquier archivo .csv en cualquier carpeta
+/**/*.csv
+# Ignorar cualquier carpeta llamada data en cualquier nivel
+**/data/
