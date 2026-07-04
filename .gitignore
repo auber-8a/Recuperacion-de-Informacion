@@ -3,3 +3,5 @@
 /**/*.csv
 # Ignorar cualquier carpeta llamada data en cualquier nivel
 **/data/
+# Agrega el nombre específico de tu notebook al archivo .gitignore
+!echo "limpiar.py" >> .gitignore
