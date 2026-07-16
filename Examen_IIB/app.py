@@ -18,7 +18,7 @@ st.set_page_config(
 # 1. DESCARGA AUTOMÁTICA Y CORRECCIÓN DE RUTA DE LA BASE DE DATOS
 # ==============================================================================
 
-# ID real de tu archivo "chroma_db.zip" en Google Drive
+# ID de tu archivo "chroma_db.zip" en Google Drive
 DRIVE_INPUT = "1u24Q94CCrSGMdoqvWCIqTTT3AlWzG6kG" 
 
 def get_clean_drive_id(input_string):
@@ -31,36 +31,35 @@ def get_clean_drive_id(input_string):
     return input_string.strip()
 
 DRIVE_FILE_ID = get_clean_drive_id(DRIVE_INPUT)
-DB_ZIP_PATH = "chroma_db.zip"
 DB_DIR_PATH = "./chroma_db"
 
 def download_db_from_drive():
     """Descarga la base de datos de 716MB, la descomprime y asegura la ruta de ChromaDB."""
-    # Verificar si la base de datos ya está correctamente configurada para evitar re-descargas
     sqlite_file = os.path.join(DB_DIR_PATH, "chroma.sqlite3")
     
+    # Si la carpeta existe pero no tiene el archivo sqlite, está corrupta. La borramos.
     if os.path.exists(DB_DIR_PATH) and not os.path.exists(sqlite_file):
-        # Si la carpeta existe pero no tiene el archivo sqlite, está corrupta. La borramos.
         shutil.rmtree(DB_DIR_PATH)
         
     if not os.path.exists(DB_DIR_PATH):
         with st.spinner("📦 Descargando la base de datos vectorial desde Google Drive (esto puede tardar un minuto la primera vez)..."):
             url = f"https://docs.google.com/uc?export=download&id={DRIVE_FILE_ID}"
+            temp_zip = "downloaded_db.zip"
             try:
-                # Descargar el zip
-                urllib.request.urlretrieve(url, DB_ZIP_PATH)
+                # Descargar el zip con un nombre temporal seguro
+                urllib.request.urlretrieve(url, temp_zip)
                 
-                # Crear carpeta destino temporal
+                # Crear carpeta destino temporal para extraer
                 temp_extract_dir = "./temp_extract"
                 if os.path.exists(temp_extract_dir):
                     shutil.rmtree(temp_extract_dir)
                 os.makedirs(temp_extract_dir)
                 
                 # Descomprimir
-                with zipfile.ZipFile(DB_ZIP_PATH, 'r') as zip_ref:
+                with zipfile.ZipFile(temp_zip, 'r') as zip_ref:
                     zip_ref.extractall(temp_extract_dir)
                 
-                # Buscar dinámicamente dónde quedó el archivo chroma.sqlite3
+                # Buscar dinámicamente el archivo chroma.sqlite3 en todo lo descomprimido
                 sqlite_found_path = None
                 for root, dirs, files in os.walk(temp_extract_dir):
                     if "chroma.sqlite3" in files:
@@ -68,23 +67,23 @@ def download_db_from_drive():
                         break
                 
                 if sqlite_found_path:
-                    # Mover la carpeta que contiene el sqlite a la ruta esperada './chroma_db'
+                    # Mover la carpeta que contiene el sqlite a './chroma_db'
                     shutil.move(sqlite_found_path, DB_DIR_PATH)
                     st.success("¡Base de datos cargada e inicializada exitosamente!")
                 else:
-                    st.error("No se encontró el archivo 'chroma.sqlite3' dentro del archivo ZIP de Drive.")
+                    st.error("No se encontró el archivo 'chroma.sqlite3' dentro de la descarga de Google Drive.")
                 
-                # Limpiar archivos temporales
-                if os.path.exists(DB_ZIP_PATH):
-                    os.remove(DB_ZIP_PATH)
+                # Limpiar temporales
+                if os.path.exists(temp_zip):
+                    os.remove(temp_zip)
                 if os.path.exists(temp_extract_dir):
                     shutil.rmtree(temp_extract_dir)
                     
             except Exception as e:
-                st.error(f"Error al descargar la base de datos de Google Drive: {e}")
-                st.info("Asegúrate de que el archivo en Drive sea público.")
+                st.error(f"Error al descargar o procesar la base de datos: {e}")
+                st.info("Asegúrate de que el archivo 'chroma_db.zip' en tu Drive sea público.")
 
-# Ejecutar descarga e inspección de ruta
+# Ejecutar la descarga
 download_db_from_drive()
 
 # ==============================================================================
@@ -95,7 +94,6 @@ def load_resources():
     embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     reranker = CrossEncoder("ms-marco-MiniLM-L-6-v2")
     
-    # Abrir la persistencia apuntando a la carpeta corregida
     chroma_client = chromadb.PersistentClient(path=DB_DIR_PATH)
     collection = chroma_client.get_collection(name="arxiv_papers")
     
