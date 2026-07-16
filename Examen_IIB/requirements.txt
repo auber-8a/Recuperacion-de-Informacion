@@ -3,3 +3,4 @@ chromadb
 sentence-transformers
 google-genai
 pandas
+numpy

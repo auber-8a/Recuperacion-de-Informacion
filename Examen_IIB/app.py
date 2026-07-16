@@ -1,84 +1,96 @@
 import streamlit as st
+import os
+import zipfile
+import urllib.request
+import re
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
-import os
+from google import genai
 
-# ==============================================================================
-# 1. CONFIGURACIÓN DE LA PÁGINA E INTERFAZ
-# ==============================================================================
 st.set_page_config(
-    page_title="arXiv Scientific RAG Assistant",
+    page_title="arXiv Research Assistant RAG",
     page_icon="🔬",
     layout="wide"
 )
 
-st.title("🔬 arXiv Research RAG Assistant")
-st.markdown("""
-Bienvenido al asistente de recuperación científica. Realiza consultas en lenguaje natural 
-sobre el corpus de artículos de arXiv. El sistema utiliza **Búsqueda Semántica Densa**, 
-un modelo **Cross-Encoder para Re-ranking**, y un **LLM** para formular respuestas con base científica.
-""")
+# ==============================================================================
+# 1. DESCARGA AUTOMÁTICA DE LA BASE DE DATOS DESDE GOOGLE DRIVE
+# ==============================================================================
+
+# URL o ID que proporcionaste de tu recurso en Drive
+DRIVE_INPUT = "1u24Q94CCrSGMdoqvWCIqTTT3AlWzG6kG" 
+
+# Extrae el ID limpio usando una expresión regular por si se pasa una URL completa
+def get_clean_drive_id(input_string):
+    match = re.search(r'/d/([a-zA-Z0-9-_]+)', input_string)
+    if match:
+        return match.group(1)
+    match_folder = re.search(r'/folders/([a-zA-Z0-9-_]+)', input_string)
+    if match_folder:
+        return match_folder.group(1)
+    return input_string.strip()
+
+DRIVE_FILE_ID = get_clean_drive_id(DRIVE_INPUT)
+DB_ZIP_PATH = "chroma_db.zip"
+DB_DIR_PATH = "./chroma_db"
+
+def download_db_from_drive():
+    """Descarga la base de datos de 716MB desde Google Drive si no existe."""
+    if not os.path.exists(DB_DIR_PATH):
+        with st.spinner("📦 Descargando la base de datos vectorial desde Google Drive (esto puede tardar un minuto la primera vez)..."):
+            # URL de descarga directa para Google Drive
+            url = f"https://docs.google.com/uc?export=download&id={DRIVE_FILE_ID}"
+            try:
+                # Descargar el zip
+                urllib.request.urlretrieve(url, DB_ZIP_PATH)
+                
+                # Descomprimirlo
+                with zipfile.ZipFile(DB_ZIP_PATH, 'r') as zip_ref:
+                    zip_ref.extractall(".")
+                
+                # Borrar el archivo .zip descargado para ahorrar espacio en el servidor
+                os.remove(DB_ZIP_PATH)
+                st.success("¡Base de datos cargada exitosamente!")
+            except Exception as e:
+                st.error(f"Error al descargar la base de datos de Google Drive: {e}")
+                st.info("Asegúrate de que subiste el archivo 'chroma_db.zip' individual a tu Drive, que sea público y que el ID sea el correcto.")
+
+# Ejecutar descarga antes de cargar recursos
+download_db_from_drive()
 
 # ==============================================================================
-# 2. CARGA EFICIENTE DE MODELOS Y BASE DE DATOS (CACHED)
+# CARGA DE RECURSOS (Modelos y Base de Datos Vectorial)
 # ==============================================================================
 @st.cache_resource
 def load_resources():
-    # Carga de modelos de SentenceTransformers
     embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    reranker_model = CrossEncoder("ms-marco-MiniLM-L-6-v2")
+    reranker = CrossEncoder("ms-marco-MiniLM-L-6-v2")
     
-    # Conexión a la Base de Datos Vectorial Persistente previamente guardada
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    chroma_client = chromadb.PersistentClient(path=DB_DIR_PATH)
     collection = chroma_client.get_collection(name="arxiv_papers")
     
-    return embedding_model, reranker_model, collection
+    return embedding_model, reranker, collection
 
 try:
-    bi_encoder, cross_encoder, vector_collection = load_resources()
-    st.success(f"✅ Modelos indexados y base vectorial cargada ({vector_collection.count()} papers listos).")
+    embedding_model, reranker, collection = load_resources()
 except Exception as e:
-    st.error(f"❌ Error al cargar los recursos o la carpeta ./chroma_db: {e}")
-    st.stop()
+    st.error(f"Error al inicializar la base de datos: {e}")
 
 # ==============================================================================
-# 3. PIPELINE DE RECUPERACIÓN Y RE-RANKING
+# 2. CLIENTE DE GEMINI Y GENERACIÓN RAG
 # ==============================================================================
-def retrieve_and_rerank(query, top_n=10, top_k=3):
-    query_embedding = bi_encoder.encode([query]).tolist()
-    initial_results = vector_collection.query(
-        query_embeddings=query_embedding,
-        n_results=top_n
-    )
-    
-    fetched_docs = initial_results['documents'][0]
-    fetched_metadatas = initial_results['metadatas'][0]
-    
-    if not fetched_docs:
-        return []
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-    # Re-ranking con el CrossEncoder
-    pairs = [[query, doc] for doc in fetched_docs]
-    rerank_scores = cross_encoder.predict(pairs)
+def generate_rag_response(query, context_documents):
+    if not GEMINI_API_KEY:
+        return "❌ Error: La variable de entorno GEMINI_API_KEY no está configurada en los Secrets de la plataforma."
     
-    scored_docs = list(zip(fetched_docs, fetched_metadatas, rerank_scores))
-    scored_docs.sort(key=lambda x: x[2], reverse=True)
-    
-    return scored_docs[:top_k]
-
-# ==============================================================================
-# 4. COMPONENTE DE GENERACIÓN LLM (EJEMPLO CON GEMINI API SECURE)
-# ==============================================================================
-def generate_llm_response(query, evidence_docs):
-    # Recuperación segura de la API KEY desde variables de entorno de la nube
-    api_key = os.environ.get("GEMINI_API_KEY")
-    
+    # Concatenar los contextos seleccionados por el Re-ranker
     context_text = ""
-    for i, (doc, meta, score) in enumerate(evidence_docs):
+    for i, (doc, meta, score) in enumerate(context_documents):
         context_text += f"--- Document Evidence #{i+1} (Re-rank Score: {score:.4f}) ---\n"
-        context_text += f"{doc}\n\n"
-
-    # Prompt con restricciones explícitas contra alucinaciones (Requerimiento de examen)
+        context_text += f"Title: {meta.get('title')}\nAbstract: {meta.get('abstract')}\n\n"
+        
     prompt = f"""
 You are an expert scientific research assistant. Answer the user's query using strictly the provided document evidences from arXiv papers. 
 If the evidence does not contain enough information to answer the query, clearly state that the corpus does not contain sufficient information.
@@ -90,75 +102,97 @@ User Query: {query}
 
 Answer:
 """
-    
-    if not api_key:
-        # Fallback didáctico en caso de que falte configurar la variable de entorno en la nube
-        return f"⚠️ [API Key no configurada]. El prompt estructurado con evidencias se generó con éxito:\n\n{prompt}"
-
     try:
-        # Reemplazar por tu cliente LLM preferido (ej. google-genai)
-        from google import genai
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=GEMINI_API_KEY)
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
+            model='gemini-2.5-flash', 
+            contents=prompt
         )
         return response.text
     except Exception as e:
-        return f"❌ Error en la llamada al LLM: {e}"
+        return f"❌ Error al conectar con la API de Gemini: {e}"
+
+# Función auxiliar para recuperar y re-rankear
+def retrieve_and_rerank_local(query, top_n=8, top_k=3):
+    query_embedding = embedding_model.encode([query]).tolist()
+    initial_results = collection.query(query_embeddings=query_embedding, n_results=top_n)
+    
+    fetched_docs = initial_results['documents'][0]
+    fetched_metadatas = initial_results['metadatas'][0]
+    
+    if not fetched_docs:
+        return []
+
+    pairs = [[query, doc] for doc in fetched_docs]
+    rerank_scores = reranker.predict(pairs)
+    scored_docs = list(zip(fetched_docs, fetched_metadatas, rerank_scores))
+    scored_docs.sort(key=lambda x: x[2], reverse=True)
+    
+    return scored_docs[:top_k]
 
 # ==============================================================================
-# 5. HISTORIAL DEL CHAT INTERACTIVO (REQUERIMIENTO INTERFAZ WEB)
+# 3. INTERFAZ GRÁFICA DE USUARIO (UI) - Estilo Chat
 # ==============================================================================
+
+st.title("🔬 Asistente de Investigación Científica - arXiv RAG")
+st.markdown(
+    """
+    Bienvenido al sistema de consulta inteligente de papers científicos. 
+    Este asistente utiliza un pipeline **RAG de dos etapas** (Retriever + Re-ranker) 
+    y es alimentado por **Gemini 2.5** para garantizar respuestas precisas basadas en evidencias reales.
+    """
+)
+
+# Inicializar el historial del chat en la sesión de Streamlit si no existe
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Mostrar mensajes anteriores
+# Mostrar el historial de mensajes de forma dinámica sin reiniciar
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        # Mostrar evidencias si están adjuntas al mensaje del asistente
+        st.write(message["content"])
+        # Si tiene evidencias asociadas en el estado, las mostramos abajo
         if "evidences" in message:
-            with st.expander("🔍 Ver Evidencias Científicas Utilizadas"):
+            with st.expander("🔍 Ver Evidencias Utilizadas para esta respuesta"):
                 for idx, (doc, meta, score) in enumerate(message["evidences"]):
-                    st.markdown(f"**Documento #{idx+1} | Score: {score:.4f}**")
-                    st.markdown(f"*Título:* {meta.get('title')}")
-                    st.markdown(f"*Abstract:* {meta.get('abstract')}")
-                    st.divider()
+                    st.markdown(f"**Evidencia #{idx+1} (Score: {score:.4f})**")
+                    st.markdown(f"**Título:** {meta.get('title')}")
+                    st.markdown(f"**Abstract:** {meta.get('abstract')}")
+                    st.markdown("---")
 
-# Capturar entrada del usuario
-if user_query := st.chat_input("Escribe tu consulta aquí (ej. What are main applications of GNNs?)..."):
+# Capturar la entrada de texto del usuario
+if user_query := st.chat_input("Escribe tu consulta sobre IA, Robótica, etc. (Ej: How is reinforcement learning used in robotics?)"):
     
-    # 1. Mostrar mensaje del usuario
+    # 1. Mostrar la pregunta en la pantalla de inmediato
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
-        st.markdown(user_query)
+        st.write(user_query)
         
-    # 2. Procesar respuesta del Asistente
+    # 2. Generar la respuesta del backend
     with st.chat_message("assistant"):
-        with st.spinner("Buscando en arXiv y re-rankeando evidencias..."):
-            # Recuperar y filtrar evidencias relevantes
-            top_evidences = retrieve_and_rerank(user_query)
+        with st.spinner("Buscando en arXiv y analizando evidencias..."):
             
-        with st.spinner("Generando respuesta aumentada (RAG)..."):
-            # Generar respuesta final usando el LLM
-            llm_response = generate_llm_response(user_query, top_evidences)
+            # Etapa de Recuperación y Re-ranking
+            evidences = retrieve_and_rerank_local(user_query)
             
-        # Renderizar respuesta
-        st.markdown(llm_response)
-        
-        # Presentar las evidencias de manera elegante en un contenedor colapsable (Requerimiento F)
-        if top_evidences:
-            with st.expander("🔍 Ver Evidencias Científicas Utilizadas"):
-                for idx, (doc, meta, score) in enumerate(top_evidences):
-                    st.markdown(f"**Documento #{idx+1} | Score: {score:.4f}**")
-                    st.markdown(f"*Título:* {meta.get('title')}")
-                    st.markdown(f"*Abstract:* {meta.get('abstract')}")
-                    st.divider()
-                    
-        # Guardar en el estado de la sesión
+            # Etapa de Generación con LLM
+            response_text = generate_rag_response(user_query, evidences)
+            
+            # Mostrar la respuesta
+            st.write(response_text)
+            
+            # Mostrar las evidencias de forma interactiva
+            if evidences:
+                with st.expander("🔍 Ver Evidencias Utilizadas para esta respuesta"):
+                    for idx, (doc, meta, score) in enumerate(evidences):
+                        st.markdown(f"**Evidencia #{idx+1} (Score: {score:.4f})**")
+                        st.markdown(f"**Título:** {meta.get('title')}")
+                        st.markdown(f"**Abstract:** {meta.get('abstract')}")
+                        st.markdown("---")
+                        
+        # Guardar la respuesta y sus evidencias en la sesión de Streamlit
         st.session_state.messages.append({
             "role": "assistant", 
-            "content": llm_response,
-            "evidences": top_evidences
+            "content": response_text,
+            "evidences": evidences
         })
