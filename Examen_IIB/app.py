@@ -3,6 +3,7 @@ import os
 import zipfile
 import urllib.request
 import re
+import shutil
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from google import genai
@@ -14,13 +15,12 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# 1. DESCARGA AUTOMÁTICA DE LA BASE DE DATOS DESDE GOOGLE DRIVE
+# 1. DESCARGA AUTOMÁTICA Y CORRECCIÓN DE RUTA DE LA BASE DE DATOS
 # ==============================================================================
 
-# URL o ID que proporcionaste de tu recurso en Drive
+# ID real de tu archivo "chroma_db.zip" en Google Drive
 DRIVE_INPUT = "1u24Q94CCrSGMdoqvWCIqTTT3AlWzG6kG" 
 
-# Extrae el ID limpio usando una expresión regular por si se pasa una URL completa
 def get_clean_drive_id(input_string):
     match = re.search(r'/d/([a-zA-Z0-9-_]+)', input_string)
     if match:
@@ -35,27 +35,56 @@ DB_ZIP_PATH = "chroma_db.zip"
 DB_DIR_PATH = "./chroma_db"
 
 def download_db_from_drive():
-    """Descarga la base de datos de 716MB desde Google Drive si no existe."""
+    """Descarga la base de datos de 716MB, la descomprime y asegura la ruta de ChromaDB."""
+    # Verificar si la base de datos ya está correctamente configurada para evitar re-descargas
+    sqlite_file = os.path.join(DB_DIR_PATH, "chroma.sqlite3")
+    
+    if os.path.exists(DB_DIR_PATH) and not os.path.exists(sqlite_file):
+        # Si la carpeta existe pero no tiene el archivo sqlite, está corrupta. La borramos.
+        shutil.rmtree(DB_DIR_PATH)
+        
     if not os.path.exists(DB_DIR_PATH):
         with st.spinner("📦 Descargando la base de datos vectorial desde Google Drive (esto puede tardar un minuto la primera vez)..."):
-            # URL de descarga directa para Google Drive
             url = f"https://docs.google.com/uc?export=download&id={DRIVE_FILE_ID}"
             try:
                 # Descargar el zip
                 urllib.request.urlretrieve(url, DB_ZIP_PATH)
                 
-                # Descomprimirlo
-                with zipfile.ZipFile(DB_ZIP_PATH, 'r') as zip_ref:
-                    zip_ref.extractall(".")
+                # Crear carpeta destino temporal
+                temp_extract_dir = "./temp_extract"
+                if os.path.exists(temp_extract_dir):
+                    shutil.rmtree(temp_extract_dir)
+                os.makedirs(temp_extract_dir)
                 
-                # Borrar el archivo .zip descargado para ahorrar espacio en el servidor
-                os.remove(DB_ZIP_PATH)
-                st.success("¡Base de datos cargada exitosamente!")
+                # Descomprimir
+                with zipfile.ZipFile(DB_ZIP_PATH, 'r') as zip_ref:
+                    zip_ref.extractall(temp_extract_dir)
+                
+                # Buscar dinámicamente dónde quedó el archivo chroma.sqlite3
+                sqlite_found_path = None
+                for root, dirs, files in os.walk(temp_extract_dir):
+                    if "chroma.sqlite3" in files:
+                        sqlite_found_path = root
+                        break
+                
+                if sqlite_found_path:
+                    # Mover la carpeta que contiene el sqlite a la ruta esperada './chroma_db'
+                    shutil.move(sqlite_found_path, DB_DIR_PATH)
+                    st.success("¡Base de datos cargada e inicializada exitosamente!")
+                else:
+                    st.error("No se encontró el archivo 'chroma.sqlite3' dentro del archivo ZIP de Drive.")
+                
+                # Limpiar archivos temporales
+                if os.path.exists(DB_ZIP_PATH):
+                    os.remove(DB_ZIP_PATH)
+                if os.path.exists(temp_extract_dir):
+                    shutil.rmtree(temp_extract_dir)
+                    
             except Exception as e:
                 st.error(f"Error al descargar la base de datos de Google Drive: {e}")
-                st.info("Asegúrate de que subiste el archivo 'chroma_db.zip' individual a tu Drive, que sea público y que el ID sea el correcto.")
+                st.info("Asegúrate de que el archivo en Drive sea público.")
 
-# Ejecutar descarga antes de cargar recursos
+# Ejecutar descarga e inspección de ruta
 download_db_from_drive()
 
 # ==============================================================================
@@ -66,6 +95,7 @@ def load_resources():
     embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     reranker = CrossEncoder("ms-marco-MiniLM-L-6-v2")
     
+    # Abrir la persistencia apuntando a la carpeta corregida
     chroma_client = chromadb.PersistentClient(path=DB_DIR_PATH)
     collection = chroma_client.get_collection(name="arxiv_papers")
     
@@ -85,7 +115,6 @@ def generate_rag_response(query, context_documents):
     if not GEMINI_API_KEY:
         return "❌ Error: La variable de entorno GEMINI_API_KEY no está configurada en los Secrets de la plataforma."
     
-    # Concatenar los contextos seleccionados por el Re-ranker
     context_text = ""
     for i, (doc, meta, score) in enumerate(context_documents):
         context_text += f"--- Document Evidence #{i+1} (Re-rank Score: {score:.4f}) ---\n"
@@ -112,7 +141,6 @@ Answer:
     except Exception as e:
         return f"❌ Error al conectar con la API de Gemini: {e}"
 
-# Función auxiliar para recuperar y re-rankear
 def retrieve_and_rerank_local(query, top_n=8, top_k=3):
     query_embedding = embedding_model.encode([query]).tolist()
     initial_results = collection.query(query_embeddings=query_embedding, n_results=top_n)
@@ -143,15 +171,12 @@ st.markdown(
     """
 )
 
-# Inicializar el historial del chat en la sesión de Streamlit si no existe
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Mostrar el historial de mensajes de forma dinámica sin reiniciar
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
-        # Si tiene evidencias asociadas en el estado, las mostramos abajo
         if "evidences" in message:
             with st.expander("🔍 Ver Evidencias Utilizadas para esta respuesta"):
                 for idx, (doc, meta, score) in enumerate(message["evidences"]):
@@ -160,28 +185,19 @@ for message in st.session_state.messages:
                     st.markdown(f"**Abstract:** {meta.get('abstract')}")
                     st.markdown("---")
 
-# Capturar la entrada de texto del usuario
 if user_query := st.chat_input("Escribe tu consulta sobre IA, Robótica, etc. (Ej: How is reinforcement learning used in robotics?)"):
     
-    # 1. Mostrar la pregunta en la pantalla de inmediato
     st.session_state.messages.append({"role": "user", "content": user_query})
     with st.chat_message("user"):
         st.write(user_query)
         
-    # 2. Generar la respuesta del backend
     with st.chat_message("assistant"):
         with st.spinner("Buscando en arXiv y analizando evidencias..."):
             
-            # Etapa de Recuperación y Re-ranking
             evidences = retrieve_and_rerank_local(user_query)
-            
-            # Etapa de Generación con LLM
             response_text = generate_rag_response(user_query, evidences)
-            
-            # Mostrar la respuesta
             st.write(response_text)
             
-            # Mostrar las evidencias de forma interactiva
             if evidences:
                 with st.expander("🔍 Ver Evidencias Utilizadas para esta respuesta"):
                     for idx, (doc, meta, score) in enumerate(evidences):
@@ -190,7 +206,6 @@ if user_query := st.chat_input("Escribe tu consulta sobre IA, Robótica, etc. (E
                         st.markdown(f"**Abstract:** {meta.get('abstract')}")
                         st.markdown("---")
                         
-        # Guardar la respuesta y sus evidencias en la sesión de Streamlit
         st.session_state.messages.append({
             "role": "assistant", 
             "content": response_text,
